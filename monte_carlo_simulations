@@ -1,0 +1,124 @@
+##### Method for creating simulations of projected mining land use #####
+
+# Load required packages
+library(terra)
+library(sf)
+library(readxl)
+library(dplyr)
+library(stringr)
+
+# Define file path for mining data (.xlsx)
+excel_path <- "file-path.xlsx"
+
+# Define file path for Protected Areas data (.tif) (used here only to get the CRS)
+WDPA <- "file-path.tif"
+
+# Load raster to determine the CRS
+WDPA <- rast(WDPA)
+WDPA_crs <- crs(WDPA)
+
+# Read mining points and transform to WDPA_crs, selecting relevant columns
+df <- read_excel(excel_path) %>%
+  select(LONGITUDE, LATITUDE, NI_TONNES, DEPOSIT_TYPE, PROP_ID) # Change to column headings in your excel file
+if (!all(c("LONGITUDE", "LATITUDE", "NI_TONNES", "PROP_ID", "DEPOSIT_TYPE") %in% colnames(df))) {
+  stop("Missing required columns in the Excel file.")
+}
+points_sf <- st_as_sf(df, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+points_sf <- st_transform(points_sf, crs = WDPA_crs)
+
+# Simulation parameters
+n_simulations <- X # Update with recommended simulation number, produced from power analysis
+max_shift <- 15000 # Update with preferred distance of mining point shift (m)
+
+# Create output folder if it doesn't exist
+output_folder <- "file-path"
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+# Function to generate simulation buffers for one iteration
+simulate_buffers <- function() {
+  mine_buffers_list <- lapply(1:nrow(points_sf), function(i) {
+    mine <- points_sf[i, ]
+    
+    # Random shift
+    shift_x <- runif(1, -max_shift, max_shift)
+    shift_y <- runif(1, -max_shift, max_shift)
+    shifted_point <- st_geometry(mine) + c(shift_x, shift_y)
+    
+    # Determine multiplier (in m²/tonne) with min and max caps based on deposit type
+    if(mine$DEPOSIT_TYPE == "Magmatic Sulphide") {
+      m <- rlnorm(1, meanlog = log(30), sdlog = 1.57)
+      if(m < 4) m <- 4
+      if(m > 398) m <- 398
+      multiplier <- m
+    } else if(mine$DEPOSIT_TYPE == "Laterite") {
+      m <- rlnorm(1, meanlog = log(50), sdlog = 0.93)
+      if(m < 7) m <- 7
+      if(m > 229) m <- 229
+      multiplier <- m
+    } else {
+      if(runif(1) < 0.5) {
+        m <- rlnorm(1, meanlog = log(30), sdlog = 1.57)
+        if(m < 4) m <- 4
+        if(m > 398) m <- 398
+        multiplier <- m
+      } else {
+        m <- rlnorm(1, meanlog = log(50), sdlog = 0.93)
+        if(m < 7) m <- 7
+        if(m > 229) m <- 229
+        multiplier <- m
+      }
+    }
+    
+    # Calculate the area (in m²) based on tonnage and the multiplier
+    area_m2 <- mine$NI_TONNES * multiplier
+    
+    # Compute the initial buffer radius (in meters) from the area
+    initial_radius <- sqrt(area_m2 / pi)
+    
+    # Define area caps in m² based on deposit type:
+    # For Laterite: min 2.731346 km², max 70.959627 km².
+    # For Magmatic Sulphide and others: min 0.397084 km², max 79.449586 km²
+    if(mine$DEPOSIT_TYPE == "Laterite") {
+      min_area <- 2.731346e6
+      max_area <- 70.959627e6
+    } else if(mine$DEPOSIT_TYPE == "Magmatic Sulphide") {
+      min_area <- 0.397084e6
+      max_area <- 79.449586e6
+    } else {
+      min_area <- 0.397084e6
+      max_area <- 79.449586e6
+    }
+    
+    # Compute the circle area from the initial radius (should equal area_m2 if within bounds)
+    computed_area <- pi * initial_radius^2
+    
+    # Adjust the radius if the computed area is outside the allowed limits
+    adjusted_radius <- initial_radius
+    if(computed_area < min_area) {
+      adjusted_radius <- sqrt(min_area / pi)
+    } else if(computed_area > max_area) {
+      adjusted_radius <- sqrt(max_area / pi)
+    }
+    
+    # Create buffer using the adjusted radius
+    st_buffer(st_sfc(shifted_point, crs = WDPA_crs), dist = adjusted_radius)
+  })
+  
+  # Create an sf object with the PROP_ID for each buffer
+  buffers_geom <- st_sfc(lapply(mine_buffers_list, function(x) x[[1]]), crs = WDPA_crs)
+  mine_buffers_sf <- st_sf(PROP_ID = points_sf$PROP_ID, geometry = buffers_geom)
+  return(mine_buffers_sf)
+}
+
+# Run simulations and save each simulation's buffers as an RDS file
+for (sim in 1:n_simulations) {
+  cat("Running simulation", sim, "\n")
+  sim_buffers <- simulate_buffers()
+  output_file <- file.path(output_folder, paste0("simulation_", sprintf("%03d", sim), ".rds"))
+  saveRDS(sim_buffers, output_file)
+  cat("Simulation", sim, "saved to", output_file, "\n")
+}
+
+cat("All simulations complete!\n")
