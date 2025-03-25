@@ -1,0 +1,177 @@
+##### Method for Monte Carlo power analysis #####
+
+# Load required packages
+library(sf)
+library(dplyr)
+library(readxl)
+library(writexl)
+
+# Read mining points from Excel, including DEPOSIT_TYPE and NI_TONNES
+excel_path <- "file-path.xlsx"
+points_data <- read_excel(excel_path) %>%
+  filter(MINING_STAGE == "Exploration", DEPOSIT_TYPE != "Seafloor") %>%  # Exclude Seafloor deposits
+  select(LONGITUDE, LATITUDE, NI_TONNES, DEPOSIT_TYPE)
+
+# Ensure NI_TONNES is numeric
+points_data <- points_data %>%
+  mutate(NI_TONNES = as.numeric(NI_TONNES))
+
+# Convert to sf object in EPSG:4326 (lat/long)
+mining_points <- st_as_sf(points_data, coords = c("LONGITUDE", "LATITUDE"), crs = 4326)
+
+# Define the projection using a PROJ string (cylindrical equal-area)
+crs_mollweide <- "+proj=moll +lon_0=0 +datum=WGS84 +units=m +no_defs"
+
+# Reproject your points
+mining_points_projected <- st_transform(mining_points, crs_mollweide)
+
+# Parametres for the Monte Carlo simulation
+max_shift <- 15000  # Maximum shift in metres
+
+# Define a function that runs a single simulation iteration:
+simulate_union_area <- function() {
+  simulation_result <- mining_points_projected %>%
+    mutate(
+      # Apply random shifts in metres
+      shift_x = runif(n(), -max_shift, max_shift),
+      shift_y = runif(n(), -max_shift, max_shift),
+      shifted_points = st_geometry(.) + cbind(shift_x, shift_y)
+    ) %>%
+    rowwise() %>%
+    mutate(
+      multiplier = case_when(
+        DEPOSIT_TYPE == "Magmatic Sulphide" ~ {
+          # Sample from a lognormal distribution with median 30 (m²/ton)
+          m <- rlnorm(1, meanlog = log(30), sdlog = 1.57)
+          if(m < 4) m <- 4
+          if(m > 398) m <- 398
+          m
+        },
+        DEPOSIT_TYPE == "Laterite" ~ {
+          # Sample from a lognormal distribution with median 50 (m²/ton)
+          m <- rlnorm(1, meanlog = log(50), sdlog = 0.93)
+          if(m < 7) m <- 7
+          if(m > 229) m <- 229
+          m
+        },
+        TRUE ~ {
+          # For other deposit types, randomly choose one of the two distributions
+          if(runif(1) < 0.5) {
+            m <- rlnorm(1, meanlog = log(30), sdlog = 1.57)
+            if(m < 4) m <- 4
+            if(m > 398) m <- 398
+            m
+          } else {
+            m <- rlnorm(1, meanlog = log(50), sdlog = 0.93)
+            if(m < 7) m <- 7
+            if(m > 229) m <- 229
+            m
+          }
+        }
+      ),
+      # Compute the initial buffer radius in metres
+      # Here, NI_TONNES * multiplier yields an area (in m²), which is then converted to a radius using sqrt(area / pi)
+      initial_radius = sqrt((NI_TONNES * multiplier) / pi),
+      # Compute the corresponding area (circle area = pi * r^2)
+      computed_area = pi * initial_radius^2,
+      # Define area caps (convert km² to m²) based on deposit type:
+      # For Laterite: min 2.731346 km², max 70.959627 km²
+      # For Magmatic Sulphide: min 0.397084 km², max 79.449586 km²
+      # For others: min 0.397084 km², max 149.255644 km²
+      min_area = case_when(
+        DEPOSIT_TYPE == "Laterite" ~ 2.731346e6,
+        DEPOSIT_TYPE == "Magmatic Sulphide" ~ 0.397084e6,
+        TRUE ~ 0.397084e6
+      ),
+      max_area = case_when(
+        DEPOSIT_TYPE == "Laterite" ~ 70.959627e6,
+        DEPOSIT_TYPE == "Magmatic Sulphide" ~ 79.449586e6,
+        TRUE ~ 79.449586e6
+      ),
+      # Identify buffers that are outside the allowed area boundaries:
+      capped_min = computed_area < min_area,
+      capped_max = computed_area > max_area,
+      # Adjust the radius if the computed area is outside the capped limits
+      adjusted_radius = case_when(
+        computed_area < min_area ~ sqrt(min_area / pi),
+        computed_area > max_area ~ sqrt(max_area / pi),
+        TRUE ~ initial_radius
+      ),
+      # Create buffers using the adjusted radius
+      buffer = st_buffer(shifted_points, dist = adjusted_radius)
+    ) %>%
+    ungroup()
+  
+  # Compute the union of all buffers so overlapping areas count only once
+  union_area <- as.numeric(simulation_result %>% summarise(total_area = st_area(st_union(buffer))) %>% pull(total_area))
+  
+  # Count how many buffers were capped on the lower and upper bounds
+  n_capped_min <- sum(simulation_result$capped_min)
+  n_capped_max <- sum(simulation_result$capped_max)
+  
+  list(union_area = union_area,
+       n_capped_min = n_capped_min,
+       n_capped_max = n_capped_max)
+}
+
+# -------------------------------
+# Step 1. Pilot Simulation
+# -------------------------------
+# Run a pilot simulation to estimate the mean and standard deviation
+pilot_n <- 1000
+pilot_results <- replicate(pilot_n, simulate_union_area(), simplify = FALSE)
+
+# Extract union areas and capping counts from each simulation iteration
+pilot_areas <- sapply(pilot_results, function(x) x$union_area)
+pilot_capped_min <- sapply(pilot_results, function(x) x$n_capped_min)
+pilot_capped_max <- sapply(pilot_results, function(x) x$n_capped_max)
+
+pilot_mean <- mean(pilot_areas)
+pilot_sd <- sd(pilot_areas)
+
+cat("Pilot mean union area:", pilot_mean, "\n")
+cat("Pilot standard deviation:", pilot_sd, "\n")
+
+# Create a summary dataframe for the pilot simulation iterations
+pilot_summary <- data.frame(
+  simulation = 1:pilot_n,
+  union_area = pilot_areas,
+  n_capped_min = pilot_capped_min,
+  n_capped_max = pilot_capped_max,
+  total_buffers = nrow(mining_points_projected)  # Constant for all iterations
+)
+
+# -------------------------------
+# Step 2. Define the Effect Size of Interest
+# -------------------------------
+# Here, we set the effect size (delta) as a 5% difference relative to the pilot mean
+delta <- pilot_mean * 0.05
+
+# -------------------------------
+# Step 3. Conduct the Power Analysis
+# -------------------------------
+# We use a one-sample t-test power analysis
+# The goal is to detect a difference of delta with 95% power at a 5% significance level
+power_result <- power.t.test(n = NULL,
+                             delta = delta,
+                             sd = pilot_sd,
+                             sig.level = 0.05,
+                             power = 0.95,
+                             type = "one.sample",
+                             alternative = "two.sided")
+
+suggested_simulations <- ceiling(power_result$n)
+cat("Suggested minimum number of simulations based on power analysis:", suggested_simulations, "\n")
+
+# -------------------------------
+# Save results to Excel
+# -------------------------------
+# Create a data frame with the pilot mean and standard deviation
+pilot_stats <- data.frame(
+  Statistic = c("Mean Union Area", "Standard Deviation"),
+  Value = c(pilot_mean, pilot_sd)
+)
+
+# Write both data frames to an Excel file with two sheets
+output_path <- "your-path/pilot_results.xlsx"
+write_xlsx(list("Pilot Summary" = pilot_summary, "Pilot Stats" = pilot_stats), path = output_path)
