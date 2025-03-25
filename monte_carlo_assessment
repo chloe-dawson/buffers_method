@@ -1,0 +1,115 @@
+##### Method for assessing Protected Area overlap with mining across Monte Carlo simulations #####
+
+# Load required packages
+library(terra)
+library(sf)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(openxlsx)
+
+# Define file paths
+excel_path <- "file-path.xlsx" # Path to your mining data
+WDPA_raster_path <- "file-path.tif" # Path to Protected Areas data
+simulations_folder <- "file-path"  # Folder with simulation buffers
+
+# Load the WDPA raster and get its CRS
+WDPA <- rast(WDPA_raster_path)
+WDPA_crs <- crs(WDPA)
+
+# List simulation files (assumed to be .rds files)
+simulation_files <- list.files(simulations_folder, pattern = "\\.rds$", full.names = TRUE)
+if(length(simulation_files) == 0) stop("No simulation files found in folder.")
+
+# Function to process one simulation’s buffers and compute WDPA overlap
+process_simulation_WDPA <- function(sim_buffers, sim_number) {
+  # Ensure simulation buffers are in the same CRS as the WDPA raster
+  if (st_crs(sim_buffers)$proj4string != WDPA_crs) {
+    sim_buffers <- st_transform(sim_buffers, crs = WDPA_crs)
+  }
+  
+  # Crop and mask the WDPA raster to the union of the buffers
+  unioned_buffers <- st_union(sim_buffers)
+  unioned_vect <- vect(unioned_buffers)
+  
+  WDPA_cropped <- crop(WDPA, unioned_vect)
+  WDPA_masked <- mask(WDPA_cropped, unioned_vect)
+  
+  # Convert the WDPA raster to polygons, dissolving contiguous areas
+  WDPA_polys <- terra::as.polygons(WDPA_masked, dissolve = TRUE)
+  WDPA_polys_sf <- st_as_sf(WDPA_polys)
+  
+  # Assume any non-NA value indicates a Protected Area
+  pa_value_col <- names(WDPA_polys_sf)[1]
+  WDPA_pa_sf <- WDPA_polys_sf[!is.na(WDPA_polys_sf[[pa_value_col]]), ]
+  
+  simulation_results <- list()
+  
+  # Loop over each mine buffer
+  for(i in seq_len(nrow(sim_buffers))) {
+    buffer <- sim_buffers[i, ]
+    
+    # Calculate intersection between the mine buffer and WDPA polygons
+    inters <- st_intersection(buffer, WDPA_pa_sf)
+    if(nrow(inters) == 0) next  # Skip if no overlap
+    
+    # Loop over each intersected polygon to record its grid value and area
+    for(j in seq_len(nrow(inters))) {
+      poly <- inters[j, ]
+      poly_area_km2 <- as.numeric(st_area(poly)) / 1e6  # Convert m² to km²
+      
+      # Extract the WDPA grid value from the attribute column
+      wdpa_value <- poly[[pa_value_col]]
+      
+      simulation_results[[length(simulation_results) + 1]] <- data.frame(
+        Simulation = sim_number,
+        PROP_ID = buffer$PROP_ID,
+        WDPA_Overlap_km2 = poly_area_km2,
+        WDPA_Value = wdpa_value
+      )
+    }
+  }
+  
+  if(length(simulation_results) == 0) {
+    return(data.frame())
+  } else {
+    do.call(rbind, simulation_results)
+  }
+}
+
+# Initialise a data frame to store all simulation results
+all_simulation_results <- data.frame()
+
+# Loop over simulation files, process each simulation, and compile results
+for(sim_file in simulation_files) {
+  # Extract simulation number from the filename (e.g., "simulation_001.rds")
+  sim_number <- as.numeric(str_extract(basename(sim_file), "\\d+"))
+  cat("Processing simulation", sim_number, "\n")
+  
+  sim_buffers <- readRDS(sim_file)
+  sim_results <- process_simulation_WDPA(sim_buffers, sim_number)
+  
+  all_simulation_results <- rbind(all_simulation_results, sim_results)
+  cat("Simulation", sim_number, "processed.\n")
+}
+
+# Summarise results by individual mine (PROP_ID)
+summary_results <- all_simulation_results %>%
+  group_by(PROP_ID, WDPA_Value) %>%
+  summarise(
+    Mean_WDPA_Overlap_km2 = mean(WDPA_Overlap_km2),
+    SD_WDPA_Overlap_km2 = sd(WDPA_Overlap_km2),
+    Min_WDPA_Overlap_km2 = min(WDPA_Overlap_km2),
+    Max_WDPA_Overlap_km2 = max(WDPA_Overlap_km2),
+    CI_95_Lower = quantile(WDPA_Overlap_km2, 0.025),
+    CI_95_Upper = quantile(WDPA_Overlap_km2, 0.975),
+    .groups = "drop"
+  )
+
+# Write the detailed and summary results to an Excel file
+output_excel <- "file-path.xlsx"
+write.xlsx(list(MonteCarlo_Iterations = all_simulation_results,
+                MonteCarlo_Summary = summary_results),
+           output_excel, overwrite = TRUE)
+
+cat("WDPA overlap analysis complete! Final results saved in", output_excel, "\n")
