@@ -1,17 +1,18 @@
-##### Method for assessing Protected Area overlap with mining across Monte Carlo simulations #####
-
-# Load required packages
+# Load libraries
 library(terra)
 library(sf)
 library(readxl)
 library(dplyr)
+library(tidyr)
 library(stringr)
 library(openxlsx)
 
 # Define file paths
-excel_path <- "file-path.xlsx" # Path to your mining data
-WDPA_raster_path <- "file-path.tif" # Path to Protected Areas data
-simulations_folder <- "file-path"  # Folder with simulation buffers
+excel_path <- "file-path.xlsx" # File with mining data
+WDPA_raster_path <- "file-path.tif" # Protected areas data file
+simulations_folder <- "file-path/simulations_exp"  # Folder with simulation
+tonnes_info <- read_excel(excel_path) %>%
+  select(PROP_ID, NI_TONNES)
 
 # Load the WDPA raster and get its CRS
 WDPA <- rast(WDPA_raster_path)
@@ -93,23 +94,116 @@ for(sim_file in simulation_files) {
   cat("Simulation", sim_number, "processed.\n")
 }
 
-# Summarise results by individual mine (PROP_ID)
-summary_results <- all_simulation_results %>%
+### 1. Dissolve by both PROP_ID and WDPA_Value within each simulation by summing the overlap areas
+simulation_totals <- all_simulation_results %>%
+  group_by(Simulation, PROP_ID, WDPA_Value) %>%
+  summarise(Total_WDPA_Overlap_km2 = sum(WDPA_Overlap_km2), .groups = "drop")
+
+### 2. Compute summary statistics across simulations for each (PROP_ID, WDPA_Value) combination
+summary_results <- simulation_totals %>%
   group_by(PROP_ID, WDPA_Value) %>%
   summarise(
-    Mean_WDPA_Overlap_km2 = mean(WDPA_Overlap_km2),
-    SD_WDPA_Overlap_km2 = sd(WDPA_Overlap_km2),
-    Min_WDPA_Overlap_km2 = min(WDPA_Overlap_km2),
-    Max_WDPA_Overlap_km2 = max(WDPA_Overlap_km2),
-    CI_95_Lower = quantile(WDPA_Overlap_km2, 0.025),
-    CI_95_Upper = quantile(WDPA_Overlap_km2, 0.975),
+    Mean_WDPA_Overlap_km2 = mean(Total_WDPA_Overlap_km2),
+    SD_WDPA_Overlap_km2 = sd(Total_WDPA_Overlap_km2),
+    Min_WDPA_Overlap_km2 = min(Total_WDPA_Overlap_km2),
+    Max_WDPA_Overlap_km2 = max(Total_WDPA_Overlap_km2),
+    CI_95_Lower = quantile(Total_WDPA_Overlap_km2, 0.025),
+    CI_95_Upper = quantile(Total_WDPA_Overlap_km2, 0.975),
     .groups = "drop"
   )
 
-# Write the detailed and summary results to an Excel file
+### 3. Dissolve by PROP_ID only:
+#    Create a complete grid of every Simulation and every property (PROP_ID) so that properties with zero overlap are included
+simulations <- unique(all_simulation_results$Simulation)
+prop_ids <- unique(tonnes_info$PROP_ID)
+complete_simulation_prop <- expand.grid(Simulation = simulations, PROP_ID = prop_ids)
+
+# Compute the total WDPA overlap per simulation per property from the raw results
+simulation_totals_prop_raw <- all_simulation_results %>%
+  group_by(Simulation, PROP_ID) %>%
+  summarise(Total_WDPA_Overlap_km2 = sum(WDPA_Overlap_km2), .groups = "drop")
+
+# Merge the complete grid with the raw totals and fill missing values (i.e. zero overlap) with 0
+simulation_totals_prop_complete <- complete_simulation_prop %>%
+  left_join(simulation_totals_prop_raw, by = c("Simulation", "PROP_ID")) %>%
+  mutate(Total_WDPA_Overlap_km2 = ifelse(is.na(Total_WDPA_Overlap_km2), 0, Total_WDPA_Overlap_km2)) %>%
+  left_join(tonnes_info, by = "PROP_ID")
+
+# Compute summary statistics across simulations for each property
+summary_by_PROP_ID <- simulation_totals_prop_complete %>%
+  group_by(PROP_ID) %>%
+  summarise(
+    Mean_WDPA_Overlap_km2 = mean(Total_WDPA_Overlap_km2),
+    SD_WDPA_Overlap_km2 = sd(Total_WDPA_Overlap_km2),
+    Min_WDPA_Overlap_km2 = min(Total_WDPA_Overlap_km2),
+    Max_WDPA_Overlap_km2 = max(Total_WDPA_Overlap_km2),
+    CI_95_Lower = quantile(Total_WDPA_Overlap_km2, 0.025),
+    CI_95_Upper = quantile(Total_WDPA_Overlap_km2, 0.975),
+    # The tonnes value is constant per property so we take its first (and only) value.
+    NI_TONNES = first(NI_TONNES),
+    .groups = "drop"
+  )
+
+### 4. Dissolve by WDPA_Value only:
+#    For each simulation, first join the tonnes info by PROP_ID
+simulation_results_tonnes <- all_simulation_results %>%
+  left_join(tonnes_info, by = "PROP_ID")
+
+#    Then, group by Simulation, WDPA_Value, and PROP_ID to sum WDPA overlaps per property (each property contributes its tonnes only once)
+simulation_totals_wdpa_raw <- simulation_results_tonnes %>%
+  group_by(Simulation, WDPA_Value, PROP_ID) %>%
+  summarise(
+    Total_WDPA_Overlap_km2 = sum(WDPA_Overlap_km2),
+    Tonnes = first(NI_TONNES),
+    .groups = "drop"
+  )
+
+#    Sum these values by Simulation and WDPA_Value
+simulation_totals_wdpa <- simulation_totals_wdpa_raw %>%
+  group_by(Simulation, WDPA_Value) %>%
+  summarise(
+    Total_WDPA_Overlap_km2 = sum(Total_WDPA_Overlap_km2),
+    Total_Tonnes = sum(Tonnes),
+    .groups = "drop"
+  )
+
+#    Create a complete grid of Simulation x WDPA_Value so that simulations with no overlap in a WDPA group are recorded as 0
+wdpa_values <- unique(simulation_totals_wdpa$WDPA_Value)
+complete_simulation_wdpa <- expand.grid(Simulation = simulations, WDPA_Value = wdpa_values)
+
+simulation_totals_wdpa_complete <- complete_simulation_wdpa %>%
+  left_join(simulation_totals_wdpa, by = c("Simulation", "WDPA_Value")) %>%
+  mutate(
+    Total_WDPA_Overlap_km2 = ifelse(is.na(Total_WDPA_Overlap_km2), 0, Total_WDPA_Overlap_km2),
+    Total_Tonnes = ifelse(is.na(Total_Tonnes), 0, Total_Tonnes)
+  )
+
+# Compute summary statistics across simulations for each WDPA group
+summary_by_WDPA <- simulation_totals_wdpa_complete %>%
+  group_by(WDPA_Value) %>%
+  summarise(
+    Mean_WDPA_Overlap_km2 = mean(Total_WDPA_Overlap_km2),
+    SD_WDPA_Overlap_km2 = sd(Total_WDPA_Overlap_km2),
+    Min_WDPA_Overlap_km2 = min(Total_WDPA_Overlap_km2),
+    Max_WDPA_Overlap_km2 = max(Total_WDPA_Overlap_km2),
+    CI_95_Lower = quantile(Total_WDPA_Overlap_km2, 0.025),
+    CI_95_Upper = quantile(Total_WDPA_Overlap_km2, 0.975),
+    Mean_Tonnes = mean(Total_Tonnes),
+    SD_Tonnes = sd(Total_Tonnes),
+    .groups = "drop"
+  )
+
+### 5. Write all outputs to an Excel file with separate sheets
 output_excel <- "file-path.xlsx"
-write.xlsx(list(MonteCarlo_Iterations = all_simulation_results,
-                MonteCarlo_Summary = summary_results),
-           output_excel, overwrite = TRUE)
+write.xlsx(
+  list(
+    MonteCarlo_Iterations = all_simulation_results,      # Raw simulation results
+    Summary_by_PROP_ID_WDPA = summary_results,           # Summary per PROP_ID and WDPA_Value
+    Dissolved_by_PROP_ID = summary_by_PROP_ID,           # Dissolved summary by PROP_ID (with tonnes info)
+    Dissolved_by_WDPA_Value = summary_by_WDPA             # Dissolved summary by WDPA_Value (with allocated tonnes)
+  ),
+  output_excel,
+  overwrite = TRUE
+)
 
 cat("WDPA overlap analysis complete! Final results saved in", output_excel, "\n")
